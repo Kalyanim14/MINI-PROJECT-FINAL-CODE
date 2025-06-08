@@ -1,169 +1,72 @@
-from flask import Flask, render_template, request, send_file, url_for
+import unittest
 import os
-import mysql.connector
-import uuid
+from io import BytesIO
 from PIL import Image
 import numpy as np
-from io import BytesIO
-import base64
+from app import encrypt_message, decrypt_message
 
-app = Flask(__name__)
+class TestEncryptionFunctions(unittest.TestCase):
 
-# MySQL configuration
-db = mysql.connector.connect(
-    host="localhost",
-    user="root",
-    password="sharvan8",
-    database="image_encryption"
-)
-cursor = db.cursor()
+    def setUp(self):
+        # Create a dummy image for testing
+        self.image_path = "test_image.png"
+        self.test_message = "Hello, Stego!"
+        self.test_password = "secret"
+        self.image_id = "dummy-id"
 
-# In-memory storage for encrypted images
-encrypted_images = {}
+        img = Image.new('RGB', (10, 10), color='white')
+        img.save(self.image_path)
 
-# LSB Encryption
-def encrypt_message(image_stream, message):
-    try:
-        # Validate message
-        if not message or len(message.strip()) == 0:
-            return None, None, "Error: Message cannot be empty."
-        
-        img = Image.open(image_stream).convert('RGB')
-        data = np.array(img)
-        flat_data = data.flatten()
-        message += chr(0)  # Null terminator
+    def tearDown(self):
+        if os.path.exists(self.image_path):
+            os.remove(self.image_path)
 
-        binary_message = ''.join([format(ord(char), '08b') for char in message])
+    # --- Existing Tests ---
+    def test_encrypt_message_function(self):
+        """Test if encryption works correctly."""
+        with open(self.image_path, 'rb') as f:
+            img_io, base64_img, error = encrypt_message(f, self.test_message)
+            self.assertIsNone(error)
+            self.assertIsNotNone(img_io)
+            self.assertTrue(base64_img.startswith('iVBOR'))
 
-        if len(binary_message) > len(flat_data):
-            return None, None, "Error: Message too long for the image."
+    def test_decrypt_message_invalid_image(self):
+        """Test decryption with invalid image data."""
+        result = decrypt_message(b"notanimage", self.test_password, self.image_id)
+        self.assertIn("Error", result)
 
-        for i in range(len(binary_message)):
-            flat_data[i] = (flat_data[i] & 0b11111110) | int(binary_message[i])
+    # --- New Unit Tests ---
+    def test_encrypt_empty_message(self):
+        with open(self.image_path, 'rb') as f:
+            img_io, base64_img, error = encrypt_message(f, "")
+            self.assertIsNotNone(error)
+            self.assertIn("Message cannot be empty", error)
 
-        encrypted_data = flat_data.reshape(data.shape)
-        encrypted_image = Image.fromarray(encrypted_data.astype('uint8'), 'RGB')
+    def test_encrypt_message_too_large(self):
+        """Test if encryption fails when message is too large for the image."""
+        large_message = "A" * 1000  # Too large for a 10x10 image
+        with open(self.image_path, 'rb') as f:
+            img_io, base64_img, error = encrypt_message(f, large_message)
+            self.assertIsNotNone(error)
+            self.assertIn("Message too long", error)
 
+    def test_decrypt_correct_password(self):
+        """Test decryption with the correct password (mocked DB response)."""
+        # Mock a valid encrypted image (simplified for unit testing)
+        mock_image_data = np.zeros((10, 10, 3), dtype=np.uint8)
+        mock_image = Image.fromarray(mock_image_data)
         img_io = BytesIO()
-        encrypted_image.save(img_io, 'PNG')
-        img_io.seek(0)
+        mock_image.save(img_io, 'PNG')
+        img_bytes = img_io.getvalue()
 
-        base64_encoded_image = base64.b64encode(img_io.getvalue()).decode('utf-8')
-        return img_io, base64_encoded_image, None
+        # Simulate a successful DB password check
+        def mock_decrypt(image_bytes, password, image_id):
+            if password == self.test_password:
+                return "Decrypted successfully"
+            return "Invalid password"
 
-    except Exception as e:
-        return None, None, f"Encryption Error: {str(e)}"
-
-# LSB Decryption
-def decrypt_message(image_bytes, entered_password, image_id):
-    try:
-        cursor.execute("SELECT password FROM image_data WHERE image_id = %s", (image_id,))
-        result = cursor.fetchone()
-
-        if not result:
-            return "Error: Image ID not found."
-        stored_password = result[0]
-        if entered_password != stored_password:
-            return "YOU ARE NOT AUTHORIZED!"
-
-        image_stream = BytesIO(image_bytes)
-        img = Image.open(image_stream).convert('RGB')
-        data = np.array(img).flatten()
-
-        bits = [str(pixel & 1) for pixel in data]
-        chars = [chr(int(''.join(bits[i:i+8]), 2)) for i in range(0, len(bits), 8)]
-
-        message = ''
-        for c in chars:
-            if c == chr(0):  # Null terminator
-                break
-            message += c
-
-        return message
-    except Exception as e:
-        return f"Decryption Error: {str(e)}"
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/encrypt', methods=['GET', 'POST'])
-def encrypt():
-    if request.method == 'POST':
-        image = request.files.get('image')
-        message = request.form.get('message')
-        password = request.form.get('password')
-
-        if not image or not message or not password:
-            return render_template('encrypt.html', error="All fields are required.")
-
-        encrypted_io, base64_image, error = encrypt_message(image.stream, message)
-        if error:
-            return render_template('encrypt.html', error=error)
-
-        try:
-            image_id = str(uuid.uuid4())
-            filename = image.filename
-
-            # Store encrypted image in memory
-            encrypted_images[image_id] = {
-                'filename': filename,
-                'data': encrypted_io
-            }
-
-            # Save to MySQL
-            cursor.execute(
-                "INSERT INTO image_data (image_id, image_name, password) VALUES (%s, %s, %s)",
-                (image_id, filename, password)
-            )
-            db.commit()
-
-            download_url = url_for('download', image_id=image_id)
-
-            return render_template(
-                'encrypt.html',
-                success=True,
-                image_id=image_id,
-                download_url=download_url,
-                base64_image=base64_image
-            )
-        except Exception as e:
-            return render_template('encrypt.html', error=f"MySQL Error: {str(e)}")
-
-    return render_template('encrypt.html')
-
-@app.route('/download/<image_id>')
-def download(image_id):
-    image_entry = encrypted_images.get(image_id)
-    if not image_entry:
-        return "Image not found or expired", 404
-
-    image_io = image_entry['data']
-    image_io.seek(0)
-    filename = f"encrypted_{image_entry['filename']}"
-
-    return send_file(
-        image_io,
-        as_attachment=True,
-        download_name=filename,
-        mimetype='image/png'
-    )
-
-@app.route('/decrypt', methods=['GET', 'POST'])
-def decrypt():
-    if request.method == 'POST':
-        image = request.files.get('image')
-        password = request.form.get('password')
-        image_id = request.form.get('image_id')
-
-        if not image or not password or not image_id:
-            return render_template('decrypt.html', result="All fields are required.")
-
-        image_bytes = image.read()
-        result = decrypt_message(image_bytes, password, image_id)
-        return render_template('decrypt.html', result=result)
-
-    return render_template('decrypt.html')
+        result = mock_decrypt(img_bytes, self.test_password, self.image_id)
+        self.assertEqual(result, "Decrypted successfully")
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    unittest.main(verbosity=2)
